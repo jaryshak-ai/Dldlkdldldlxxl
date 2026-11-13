@@ -1,0 +1,267 @@
+name: MwGuard
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/MwGuard.yml"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Write sources
+        run: |
+          mkdir -p mg/src/main/java/mwguard mg/src/main/resources
+          cat > mg/pom.xml <<'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>mwguard</groupId>
+            <artifactId>MwGuard</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>repo-lanink-cn</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>com.nukkit-mot</groupId>
+                <artifactId>nukkit-mot</artifactId>
+                <version>1.26.30-R1</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>MwGuard</finalName>
+            </build>
+          </project>
+          POM_EOF
+          cat > mg/src/main/resources/plugin.yml <<'PLUGIN_EOF'
+          name: MwGuard
+          main: mwguard.MwGuard
+          version: 1.0.0
+          api: ["1.0.0"]
+          load: POSTWORLD
+          author: server
+          description: Запрет мобов и границы мира для миров MultiWorld
+          commands:
+            mwspawn:
+              description: Запретить мобов и включить границы в мире
+              usage: "/mwspawn <id мира> <on/off>"
+              permission: mwguard.mwspawn
+          permissions:
+            mwguard.mwspawn:
+              description: Команда /mwspawn
+              default: op
+            mwguard.bypass:
+              description: Не телепортировать за границы мира
+              default: false
+          PLUGIN_EOF
+          cat > mg/src/main/java/mwguard/MwGuard.java <<'JAVA_EOF'
+          package mwguard;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.entity.EntityCreature;
+          import cn.nukkit.entity.EntityHuman;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.entity.CreatureSpawnEvent;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.Config;
+
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /**
+           * /mwspawn <id мира> <on/off>
+           * on:  в мире запрещён спавн любых мобов (существующие удаляются), а игрок, который
+           *      улетел дальше 500 блоков по X/Z от (0,0), выше y=500 или упал ниже y=0,
+           *      телепортируется на спавн (тот же, что у /spawn из MultiWorld).
+           * ID мира: 0 = основной мир, 1-30 = mwN, 31 = nether, 32 = the_end.
+           */
+          public class MwGuard extends PluginBase implements Listener {
+
+              private static final double LIMIT_XZ = 500;
+              private static final double LIMIT_Y_MAX = 500;
+              private static final double LIMIT_Y_MIN = 0;
+
+              private Config cfg;
+              private final List<Integer> worlds = new ArrayList<>();
+
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  cfg = new Config(new File(getDataFolder(), "config.yml"), Config.YAML);
+                  worlds.addAll(cfg.getIntegerList("worlds"));
+                  getServer().getPluginManager().registerEvents(this, this);
+
+                  // проверка границ: 4 раза в секунду
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int tick) {
+                          checkPlayers();
+                      }
+                  }, 5);
+                  // подчистка уже существующих мобов: раз в 5 секунд
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int tick) {
+                          for (int id : new ArrayList<>(worlds)) clearMobs(levelOf(id));
+                      }
+                  }, 100);
+                  getLogger().info("MwGuard: защищённые миры: " + worlds);
+              }
+
+              private Level levelOf(int id) {
+                  if (id == 0) return getServer().getDefaultLevel();
+                  String name = id == 31 ? "nether" : id == 32 ? "the_end" : "mw" + id;
+                  return getServer().getLevelByName(name);
+              }
+
+              private boolean isGuarded(Level lv) {
+                  if (lv == null) return false;
+                  for (int id : worlds) {
+                      if (levelOf(id) == lv) return true;
+                  }
+                  return false;
+              }
+
+              private void save() {
+                  cfg.set("worlds", new ArrayList<>(worlds));
+                  cfg.save();
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("mwspawn")) return false;
+                  if (args.length < 2) {
+                      sender.sendMessage("Использование: /mwspawn <id мира> <on/off>");
+                      return true;
+                  }
+                  int id;
+                  try {
+                      id = Integer.parseInt(args[0].trim());
+                  } catch (NumberFormatException e) {
+                      sender.sendMessage("ID мира должен быть числом (0-32).");
+                      return true;
+                  }
+                  if (id < 0 || id > 32) {
+                      sender.sendMessage("ID мира должен быть от 0 до 32.");
+                      return true;
+                  }
+                  String s = args[1].toLowerCase();
+                  boolean on;
+                  if (s.equals("on") || s.equals("true") || s.equals("вкл")) on = true;
+                  else if (s.equals("off") || s.equals("false") || s.equals("выкл")) on = false;
+                  else {
+                      sender.sendMessage("Второй аргумент: on или off.");
+                      return true;
+                  }
+                  Integer boxed = id;
+                  if (on) {
+                      if (!worlds.contains(boxed)) worlds.add(boxed);
+                      Level lv = levelOf(id);
+                      int removed = lv == null ? 0 : clearMobs(lv);
+                      sender.sendMessage("Мир " + id + ": мобы запрещены, границы включены (|x|,|z| ≤ 500, 0 ≤ y ≤ 500)."
+                              + (lv == null ? " Мир сейчас не загружен, настройка применится при загрузке." : " Удалено мобов: " + removed + "."));
+                  } else {
+                      worlds.remove(boxed);
+                      sender.sendMessage("Мир " + id + ": защита выключена.");
+                  }
+                  save();
+                  return true;
+              }
+
+              // ---------- мобы ----------
+
+              @EventHandler
+              public void onCreatureSpawn(CreatureSpawnEvent e) {
+                  if (e.getPosition() == null) return;
+                  if (isGuarded(e.getPosition().getLevel())) e.setCancelled(true);
+              }
+
+              private int clearMobs(Level lv) {
+                  if (lv == null) return 0;
+                  int n = 0;
+                  for (Entity en : lv.getEntities()) {
+                      if (en instanceof EntityCreature && !(en instanceof EntityHuman)) {
+                          en.close();
+                          n++;
+                      }
+                  }
+                  return n;
+              }
+
+              // ---------- границы ----------
+
+              private void checkPlayers() {
+                  if (worlds.isEmpty()) return;
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      if (p.hasPermission("mwguard.bypass")) continue;
+                      Level lv = p.getLevel();
+                      if (!isGuarded(lv)) continue;
+                      double x = p.getX(), y = p.getY(), z = p.getZ();
+                      if (Math.abs(x) > LIMIT_XZ || Math.abs(z) > LIMIT_XZ || y > LIMIT_Y_MAX || y < LIMIT_Y_MIN) {
+                          toSpawn(p);
+                      }
+                  }
+              }
+
+              /** Точка спавна из конфига MultiWorld (та же, что у /spawn). */
+              private Location spawnPoint() {
+                  try {
+                      File f = new File(getDataFolder().getParentFile(), "MultiWorld/worlds.yml");
+                      if (f.exists()) {
+                          Config mw = new Config(f, Config.YAML);
+                          Level lv = levelOf(mw.getInt("spawn-world", 0));
+                          if (lv != null && mw.exists("spawn-x")) {
+                              return new Location(mw.getDouble("spawn-x", 0.5), mw.getDouble("spawn-y", 64), mw.getDouble("spawn-z", 0.5), 0, 0, lv);
+                          }
+                          if (lv != null) {
+                              return Location.fromObject(lv.getSpawnLocation(), lv);
+                          }
+                      }
+                  } catch (Throwable t) {
+                      getLogger().warning("Не удалось прочитать спавн MultiWorld: " + t);
+                  }
+                  Level def = getServer().getDefaultLevel();
+                  return Location.fromObject(def.getSpawnLocation(), def);
+              }
+
+              private void toSpawn(Player p) {
+                  Location to = spawnPoint();
+                  to.getLevel().loadChunk(((int) Math.floor(to.getX())) >> 4, ((int) Math.floor(to.getZ())) >> 4, true);
+                  p.setMotion(new Vector3(0, 0, 0));
+                  p.fallDistance = 0;
+                  p.teleport(to);
+                  p.sendMessage("§eВы вышли за границы мира. Возвращаю на спавн.");
+              }
+          }
+          JAVA_EOF
+      - name: Build
+        run: cd mg && mvn -B -q package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MwGuard
+          path: mg/target/MwGuard.jar
